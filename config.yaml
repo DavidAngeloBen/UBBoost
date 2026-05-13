@@ -1,0 +1,152 @@
+# llama-swap configuration matching the UBBoost README test chart only.
+
+listen: localhost:8080
+startPort: 8081
+
+models:
+  test-1-ubb-high-boost:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 12888
+      -ub 512
+      -ctk q4_0
+      -ctv q4_0
+      --promptprocessing-ubatchboost-size 6144
+      --promptprocessing-ubatchboost-gpu-layers 1
+      --promptprocessing-ubatchboost-spec-draft-off
+      --promptprocessing-ubatchboost-keep
+      --tokengeneration-no-warmup
+
+  test-2-ubb-standard:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 11264
+      -ub 512
+      -ctk q4_0
+      -ctv q4_0
+      --promptprocessing-ubatchboost-size 2816
+      --promptprocessing-ubatchboost-gpu-layers 1
+      --promptprocessing-ubatchboost-spec-draft-off
+      --promptprocessing-ubatchboost-keep
+      --tokengeneration-no-warmup
+
+  test-3-reference-no-mtp-no-ubb:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 11264
+      -ub 2816
+      -ctk q4_0
+      -ctv q4_0
+
+  test-4-mtp-on-ubb-off-fast:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 12288
+      -ub 768
+      -ctk q4_0
+      -ctv q4_0
+      --spec-type mtp
+      --spec-draft-n-max 2
+
+  test-4-mtp-on-ubb-off-slow:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 12288
+      -ub 512
+      -ctk q4_0
+      -ctv q4_0
+      --spec-type mtp
+      --spec-draft-n-max 2
+
+  test-5-mtp-on-ubb-on:
+    cmd: >
+      .\llama-server.exe
+      --port ${PORT}
+      -m Qwen3.6-35BA3B-MTP-Q8_0.gguf
+      --parallel 1
+      --top-k 20
+      --min-p 0.0
+      --temperature 0.6
+      --log-prefix
+      --log-timestamps
+      --threads 23
+      -ngl 99
+      --n-cpu-moe 40
+      --no-mmap
+      -c 131072
+      -b 11264
+      -ub 512
+      -ctk q4_0
+      -ctv q4_0
+      --spec-type mtp
+      --spec-draft-n-max 2
+      --promptprocessing-ubatchboost-size 2816
+      --promptprocessing-ubatchboost-gpu-layers 1
+      --promptprocessing-ubatchboost-spec-draft-off
+      --promptprocessing-ubatchboost-keep
+      --tokengeneration-no-warmup

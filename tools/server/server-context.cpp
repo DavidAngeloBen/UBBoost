@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <future>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -634,6 +635,8 @@ public:
     }
 
     ~server_context_impl() {
+        cancel_armed_default_runtime_reload();
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -651,6 +654,9 @@ private:
     bool ubatchboost_enabled = false;
     bool ubatchboost_runtime_active = false;
     bool default_runtime_active = false;
+    bool ubatchboost_default_load_started = false;
+    std::shared_ptr<std::promise<bool>> ubatchboost_default_load_release;
+    std::future<bool> ubatchboost_default_load_future;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -735,6 +741,76 @@ private:
 
     bool is_ubatchboost_requested(const common_params & params) const {
         return params.promptprocessing_ubatchboost_size > 0;
+    }
+
+    common_params make_default_runtime_reload_params() const {
+        common_params default_params_reload = params_default;
+        if (params_default.tokengeneration_no_warmup) {
+            default_params_reload.warmup = false;
+        }
+
+        return default_params_reload;
+    }
+
+    void cancel_armed_default_runtime_reload() {
+        if (!ubatchboost_default_load_started || !ubatchboost_default_load_release) {
+            return;
+        }
+
+        ubatchboost_default_load_release->set_value(false);
+        ubatchboost_default_load_release.reset();
+
+        if (ubatchboost_default_load_future.valid()) {
+            ubatchboost_default_load_future.get();
+        }
+
+        ubatchboost_default_load_started = false;
+        ubatchboost_default_load_future = {};
+    }
+
+    void launch_default_runtime_reload_task(bool wait_for_release) {
+        if (ubatchboost_default_load_started) {
+            return;
+        }
+
+        common_params default_params_reload = make_default_runtime_reload_params();
+
+        ubatchboost_default_load_started = true;
+        ubatchboost_default_load_release = wait_for_release ? std::make_shared<std::promise<bool>>() : nullptr;
+
+        SRV_INF("loading default runtime for token generation: batch = %d, ubatch = %d, gpu layers = %d, warmup = %s%s\n",
+                default_params_reload.n_batch, default_params_reload.n_ubatch, default_params_reload.n_gpu_layers,
+                default_params_reload.warmup ? "on" : "off",
+                wait_for_release ? " (armed early)" : "");
+
+        auto release = ubatchboost_default_load_release;
+        ubatchboost_default_load_future = std::async(std::launch::async, [this, default_params_reload, release]() mutable {
+            if (release) {
+                if (!release->get_future().get()) {
+                    return true;
+                }
+            }
+
+            clear_idle_prompt_state_for_runtime_reload();
+            destroy();
+
+            ubatchboost_runtime_active = false;
+            default_runtime_active = true;
+
+            return load_model_internal(default_params_reload, false);
+        });
+    }
+
+    void arm_default_runtime_reload_after_final_ubatchboost_checkpoint(const server_slot & slot) {
+        if (!should_hold_last_prompt_token_for_default_runtime(slot)) {
+            return;
+        }
+
+        if (slot.prompt.n_tokens() + 1 != slot.task->n_tokens()) {
+            return;
+        }
+
+        launch_default_runtime_reload_task(true);
     }
 
     void init_batch_for_current_context() {
@@ -2304,24 +2380,18 @@ private:
             return;
         }
 
-        clear_idle_prompt_state_for_runtime_reload();
-        destroy();
+        launch_default_runtime_reload_task(false);
 
-        common_params default_params_reload = params_default;
-        if (params_default.tokengeneration_no_warmup) {
-            default_params_reload.warmup = false;
+        if (ubatchboost_default_load_release) {
+            ubatchboost_default_load_release->set_value(true);
+            ubatchboost_default_load_release.reset();
         }
 
-        ubatchboost_runtime_active = false;
-        default_runtime_active = true;
-
-        SRV_INF("loading default runtime for token generation: batch = %d, ubatch = %d, gpu layers = %d, warmup = %s\n",
-                default_params_reload.n_batch, default_params_reload.n_ubatch, default_params_reload.n_gpu_layers,
-                default_params_reload.warmup ? "on" : "off");
-
-        if (!load_model_internal(default_params_reload, false)) {
+        if (!ubatchboost_default_load_future.get()) {
             GGML_ABORT("failed to load default runtime after prompt processing ubatch boost\n");
         }
+        ubatchboost_default_load_started = false;
+        ubatchboost_default_load_future = {};
 
         const int64_t t_default_ready = ggml_time_us();
 
@@ -3337,32 +3407,34 @@ private:
                         slot.n_prompt_tokens_processed++;
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // UBatch boost keeps extra tail checkpoints because the next chat continuation can diverge
-                        // shortly before the old prompt end. Without a checkpoint before that LCP, recurrent/hybrid
-                        // memories have to reset to zero and reprocess the whole prompt.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 512, 128, 32 (UBatch boost only)
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        // In UBB, after full logical batches, split the tail once as close to half/half as possible.
+                        // This avoids a ladder of small tail batches while still giving the next continuation one
+                        // useful checkpoint inside the tail. In the default runtime, preserve the upstream offsets.
                         if (do_checkpoint) {
-                            const int checkpoint_offsets_default[] = {4 + n_ubatch, 4};
-                            const int checkpoint_offsets_ubb[]     = {4 + n_ubatch, 512, 128, 32, 4};
-
-                            const int * checkpoint_offsets = ubatchboost_runtime_active ? checkpoint_offsets_ubb : checkpoint_offsets_default;
-                            const int   n_checkpoint_offsets = ubatchboost_runtime_active ?
-                                    (int) (sizeof(checkpoint_offsets_ubb) / sizeof(checkpoint_offsets_ubb[0])) :
-                                    (int) (sizeof(checkpoint_offsets_default) / sizeof(checkpoint_offsets_default[0]));
-
                             bool should_break = false;
-                            for (int i = 0; i < n_checkpoint_offsets; ++i) {
-                                const int offset = checkpoint_offsets[i];
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
+
+                            if (ubatchboost_runtime_active) {
+                                const int64_t n_prompt_tokens = slot.task->n_tokens();
+                                if (n_prompt_tokens > n_batch) {
+                                    const int64_t tail_start = (n_prompt_tokens / n_batch) * n_batch;
+                                    const int64_t tail_len   = n_prompt_tokens - tail_start;
+
+                                    if (tail_len > 1) {
+                                        const int64_t tail_split = tail_start + tail_len / 2;
+                                        should_break = slot.prompt.n_tokens() == tail_split;
+                                    }
+                                }
+                            } else {
+                                const int checkpoint_offsets_default[] = {4 + n_ubatch, 4};
+                                for (int offset : checkpoint_offsets_default) {
+                                    const int n_last = std::min(n_batch, offset);
+                                    if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                        should_break = true;
+                                        break;
+                                    }
                                 }
                             }
+
                             if (should_break) {
                                 break;
                             }
@@ -3425,6 +3497,7 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        arm_default_runtime_reload_after_final_ubatchboost_checkpoint(slot);
                     }
                 }
 

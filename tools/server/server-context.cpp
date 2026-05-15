@@ -3507,24 +3507,12 @@ private:
                         slot.n_prompt_tokens_processed++;
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // In UBB, after full logical batches, split the tail once as close to half/half as possible.
-                        // This avoids a ladder of small tail batches while still giving the next continuation one
-                        // useful checkpoint inside the tail. In the default runtime, preserve the upstream offsets.
+                        // In UBB, do not add an extra tail split; the batch loop already makes the final prompt batch
+                        // fit the exact remaining token count. In the default runtime, preserve the upstream offsets.
                         if (do_checkpoint) {
                             bool should_break = false;
 
-                            if (ubatchboost_runtime_active) {
-                                const int64_t n_prompt_tokens = slot.task->n_tokens();
-                                if (n_prompt_tokens > n_batch) {
-                                    const int64_t tail_start = (n_prompt_tokens / n_batch) * n_batch;
-                                    const int64_t tail_len   = n_prompt_tokens - tail_start;
-
-                                    if (tail_len > 1) {
-                                        const int64_t tail_split = tail_start + tail_len / 2;
-                                        should_break = slot.prompt.n_tokens() == tail_split;
-                                    }
-                                }
-                            } else {
+                            if (!ubatchboost_runtime_active) {
                                 const int checkpoint_offsets_default[] = {4 + n_ubatch, 4};
                                 for (int offset : checkpoint_offsets_default) {
                                     const int n_last = std::min(n_batch, offset);

@@ -2085,6 +2085,16 @@ private:
         return false;
     }
 
+    bool has_processing_slots_except(int id_slot) const {
+        for (const server_slot & slot : slots) {
+            if (slot.id != id_slot && slot.is_processing()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     bool should_hold_last_prompt_token_for_default_runtime(const server_slot & slot) const {
         if (!ubatchboost_enabled || !ubatchboost_runtime_active || default_runtime_active) {
             return false;
@@ -2302,6 +2312,56 @@ private:
         return true;
     }
 
+    bool switch_default_to_ubatchboost_runtime_for_full_prompt_reprocess(server_slot & slot) {
+        if (!ubatchboost_enabled || ubatchboost_runtime_active || !default_runtime_active) {
+            return true;
+        }
+
+        if (!slot.task || !slot.task->need_sampling() || slot.task->is_parent() || slot.task->is_child()) {
+            return true;
+        }
+
+        if (batch.n_tokens != 0) {
+            SLT_WRN(slot, "full prompt re-processing is required, but %d token(s) are already queued in this batch; continuing in default runtime\n",
+                    batch.n_tokens);
+            return true;
+        }
+
+        if (has_processing_slots_except(slot.id)) {
+            SLT_WRN(slot, "%s",
+                    "full prompt re-processing is required, but another slot is active; continuing in default runtime\n");
+            return true;
+        }
+
+        common_params boost_params = make_ubatchboost_params(params_default);
+
+        SLT_WRN(slot,
+                "full prompt re-processing is required; reloading UBBoost runtime: batch = %d, ubatch = %d, gpu layers = %d\n",
+                boost_params.n_batch, boost_params.n_ubatch, boost_params.n_gpu_layers);
+
+        cancel_armed_default_runtime_reload();
+        clear_idle_prompt_state_for_runtime_reload();
+        destroy();
+
+        ubatchboost_runtime_active = true;
+        default_runtime_active = false;
+
+        if (!load_model_internal(boost_params, false)) {
+            send_error(slot, "failed to load prompt processing ubatch boost runtime for full prompt re-processing", ERROR_TYPE_SERVER);
+            slot.release();
+            return false;
+        }
+
+        slot.prompt.tokens.clear();
+        slot.prompt.data = {};
+        slot.prompt.checkpoints.clear();
+        slot.prompt_checkpoints_tgt_only = false;
+        slot.n_prompt_tokens_cache = 0;
+        slot.n_prompt_tokens_processed = 0;
+
+        return true;
+    }
+
     bool batch_needs_speculative_process(const llama_batch & batch_view) const {
         if (!spec) {
             return false;
@@ -2342,6 +2402,7 @@ private:
             int id_task = -1;
             int64_t prompt_elapsed_us = 0;
             std::vector<uint8_t> data_tgt;
+            std::vector<uint8_t> data_dft;
         };
 
         SRV_INF("%s", "prompt processing ubatch boost boundary reached, switching to default runtime\n");
@@ -2370,6 +2431,20 @@ private:
                     send_error(slot, "failed to save prompt state before default runtime reload", ERROR_TYPE_SERVER);
                     slot.release();
                     continue;
+                }
+            }
+
+            if (ctx_dft) {
+                const size_t state_size_dft = llama_state_seq_get_size_ext(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                saved.data_dft.resize(state_size_dft);
+
+                if (state_size_dft > 0) {
+                    const size_t written = llama_state_seq_get_data_ext(ctx_dft.get(), saved.data_dft.data(), state_size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (written != state_size_dft) {
+                        send_error(slot, "failed to save draft prompt state before default runtime reload", ERROR_TYPE_SERVER);
+                        slot.release();
+                        continue;
+                    }
                 }
             }
 
@@ -2412,6 +2487,15 @@ private:
                 }
             }
 
+            if (ctx_dft && !saved.data_dft.empty()) {
+                const size_t read = llama_state_seq_set_data_ext(ctx_dft.get(), saved.data_dft.data(), saved.data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (read != saved.data_dft.size()) {
+                    send_error(slot, "failed to restore draft prompt state into default runtime", ERROR_TYPE_SERVER);
+                    slot.release();
+                    continue;
+                }
+            }
+
             slot.prompt.data = {};
 
             slot.ctx_tgt = ctx_tgt;
@@ -2428,6 +2512,10 @@ private:
                 slot.spec = nullptr;
                 slot.is_mtp_enabled = false;
                 slot.prompt_checkpoints_tgt_only = true;
+            } else if (slot.is_mtp_enabled && saved.data_dft.empty()) {
+                send_error(slot, "failed to restore MTP draft state after prompt processing ubatch boost", ERROR_TYPE_SERVER);
+                slot.release();
+                continue;
             }
 
             slot.t_start_process_prompt = t_default_ready - saved.prompt_elapsed_us;
@@ -3217,6 +3305,13 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    if (!do_reset && ctx_dft && it->data_dft.empty()) {
+                                        SLT_WRN(slot,
+                                                "context checkpoint is target-only while MTP is active (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 "); forcing full prompt re-processing instead of disabling speculative generation\n",
+                                                it->pos_min, it->pos_max, it->n_tokens);
+                                        do_reset = true;
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
 
@@ -3237,6 +3332,11 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        if (!switch_default_to_ubatchboost_runtime_for_full_prompt_reprocess(slot)) {
+                                            continue;
+                                        }
+                                        n_batch  = llama_n_batch(ctx_tgt);
+                                        n_ubatch = llama_n_ubatch(ctx_tgt);
                                     }
                                 }
                             }

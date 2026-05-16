@@ -1,31 +1,91 @@
+First of all: Feel free to copy this idea or help me out.
+I crafted an example using Codex to modify llama.cpp and it works wonderful for RTX 2080 and AMD 5900x 64GB system memory - about 2x - 10x prefill prompt processing, the larger the context, the better!
+
+So heres what I thought.
+Using large ubatch speeds up prefill tremendously, but it needs lots of vram to do so.
+We need to free vram!
+My idea is this:
+We split prompt processing and token generation.
+For prefill or prompt processing, we load all but 1 dense layer into cpu (or system ram?)
+and use the freed vram to increase ubatch as large as possible and disable MTP (didnt work out yet)
+After processing/prefilling, we load all the layers and draft to gpu to start generating token.
+I implemented this and it works out great and even does save the checkpoints, but, we had to split runtime.
+Probaly we could do this in a single runtime improving loading offloading time vastly without relying on using split runtimes or loading one model,
+then unload and load the other model, which is what I think it is doing using two runtimes. (Codex did it, not me, he said it is a big task to rework the runtime :o)
+Now, maybe you can help me out doing the big task, or improve my idea. Feel free to copy this idea or help me out.
+
 # UBBoost
+UBBoost is a private fork of official `ggml-org/llama.cpp`)
+UBBoost is focused on faster prompt processing in `llama-server` for vram constraint use cases.
 
-UBBoost is a private fork of official `ggml-org/llama.cpp` focused on faster prompt processing in `llama-server`.
+# What UBBoost Adds
 
-This fork is based on official llama.cpp and is intended to be used together with the MTP work/pull for Qwen3.6 MTP models. It also documents the test setup used with `llama-swap`.
-
-## What UBBoost Adds
-
-UBBoost adds a prompt-processing ubatch boost runtime for `llama-server`:
+##UBBoost adds a prompt-processing high ubatch size in ubatch boost runtime for `llama-server`:
 
 - prompt processing can run with a large temporary ubatch
 - token generation returns to the normal/default runtime
 - the default runtime can use different GPU layer and ubatch settings
-- MTP/spec draft can be disabled during prompt processing to free VRAM
-- the connection is kept alive during runtime reload
-- prompt cache reuse is protected so continuations do not full re-evaluate the prompt
+- the connection is kept alive during runtime reload to read PP speed but this raises an issue: retry doesnt work if model sometimes fails to generate
+- `--promptprocessing-ubatchboost-spec-draft-off` is intended to disable draft during prefill / not working yet |
+
+# What it does:
+Temporarily changes ubatch size and gpu layer in `INITIAL` first prompt processing,
+but keeps default values for following prompts via flags:
+`--promptprocessing-ubatchboost-size n`
+` --promptprocessing-ubatchboost-gpu-layers`
+`--promptprocessing-ubatchboost-n-cpu-moe`
+`n --tokengeneration-no-warmup`
+
+# How to use:
+Use high ubatch size using  `--promptprocessing-ubatchboost-size n` for PP,
+while tweaking `--promptprocessing-ubatchboost-gpu-layers n` with lower numbers, `--promptprocessing-ubatchboost-n-cpu-moe` with higher numbers
+Use low ubatch - default `-ub 512` - to free vram to leave space for more gpu layers and less MoE experts offloading.
+If you need different MoE CPU offload between prompt processing and token generation, keep normal `--n-cpu-moe` for the default runtime and use `--promptprocessing-ubatchboost-n-cpu-moe` for the UBB runtime.
+
+## Example:
+| Flag | Value |
+|------|-------|
+|`-ub`|512|
+|`--promptprocessing-ubatchboost-size`|2816|
+|`-ngl`|99|
+|`--promptprocessing-ubatchboost-gpu-layers`|1|
+|`--n-cpu-moe`|20|
+|`--promptprocessing-ubatchboost-n-cpu-moe`|40|
+
+This way, you may be able to keep your Q8 + MTP full model in gpu. After INITIAL PREFILL, it will use slower PP while reusing checkpoints. If at somepoint need to reprocess for any reason, like compacting context. It will trigger UBB again, also after the first compacting, it will need to read the context again and trigger UBB.
+
+## Default Test Settings
+
+| Flag | Value |
+|------|-------|
+|`--promptprocessing-ubatchboost-size`|2816|
+|`--promptprocessing-ubatchboost-gpu-layers`|1|
+|`--tokengeneration-no-warmup`|
+|`--spec-type`|draft-mtp|
+| `--threads` | 23 |
+| `--gpu-layers` / `-ngl` | 99, temporarily changed with UBB flag  |
+| `--n-cpu-moe` | 40 |
+| `--promptprocessing-ubatchboost-n-cpu-moe` | 40 |
+| `--no-mmap`|
+| `-c` | 131072 |
+|`-b`|11264|
+| `-ub` | 512 |
+| `-ctk` | q4_0 |
+| `-ctv` | q4_0 |
+|`--spec-draft-n-max`| 2 |
+
+VRAM usage was about 7-7.5GB on an RTX 2080 8GB.
 
 ## Current UBB Flags
 
 ```text
---promptprocessing-ubatchboost-size 6144
---promptprocessing-ubatchboost-gpu-layers 1
+--promptprocessing-ubatchboost-size n (as high as vram allowes by keeping dense layers in cpu ise flag below)
+--promptprocessing-ubatchboost-gpu-layers n (n=1 recommended)
+--promptprocessing-ubatchboost-n-cpu-moe n (UBB-only MoE CPU offload; normal --n-cpu-moe stays default runtime)
 --promptprocessing-ubatchboost-spec-draft-off
---promptprocessing-ubatchboost-keep
---tokengeneration-no-warmup
+--tokengeneration-no-warmup (for faster model switching)
+ needs testing/improvement --promptprocessing-ubatchboost-keep // keep high ubatch model loading in a session past the first PP
 ```
-
-Normal llama-server arguments still describe the default token-generation runtime. The `--promptprocessing-ubatchboost-*` arguments describe only the temporary prompt-processing boost runtime.
 
 ## Branch And Changed Files
 
@@ -33,7 +93,6 @@ Normal llama-server arguments still describe the default token-generation runtim
 |------|-------|
 | Fork name | `UBBoost` |
 | Base project | official `ggml-org/llama.cpp` |
-| Branch used locally | `master` |
 | Build target | `llama-server` |
 | Runtime manager used for tests | `llama-swap` |
 | Main config file | `config.yaml` |
@@ -42,28 +101,18 @@ Normal llama-server arguments still describe the default token-generation runtim
 |--------------|---------|
 | `common/common.h` | Added UBB/default-runtime parameter fields. |
 | `common/arg.cpp` | Added UBB CLI flags and token-generation warmup flag. |
-| `tools/server/server-context.cpp` | Implemented UBB runtime loading, default runtime restore, no-re-eval prompt cache handling, target-only checkpoint fallback, UBB tail checkpoints, and MTP/spec disabling when draft KV is missing. |
-| `tools/server/server-queue.cpp` | Added smoother streaming keep-alive behavior while runtime reload is happening. |
-| `tools/server/server-queue.h` | Added queue/reader support needed by the keep-alive path. |
+| `tools/server/server-context.cpp` | Implemented UBB runtime loading, default runtime restore, no-re-eval prompt cache handling, target-only checkpoint fallback, UBB tail checkpoints, and MTP/spec draft handling. |
+| `tools/llama-bench/llama-bench.cpp` | Added custom speculative benchmark arguments and draft-MTP/ngram acceptance reporting. |
 
 ## llama-swap
-
-This repo includes a root `config.yaml` for `llama-swap`.
-
-The YAML is intentionally only the test matrix from this README. It does not include model files, build outputs, logs, or local backup files.
-
+This repo includes a root `config.yaml` for `llama-swap` to use my bench setup with llama-swap
 Start `llama-swap` from a directory where `llama-server.exe`, `llama-swap.exe`, and the model file exist, or adjust paths in the YAML for your local layout.
 
 ## Model Used In Testing
 
-Primary model in the benchmark chart:
-
 ```text
 Qwen3.6-35BA3B-MTP-Q8_0.gguf
 ```
-
-Other local test models existed, but model files are not part of this Git upload. `*.gguf` stays ignored.
-
 ## UBB Benchmark Test Chart
 
 ### System Specifications
@@ -78,159 +127,13 @@ Other local test models existed, but model files are not part of this Git upload
 
 ## Benchmark Comparison Table
 
-| # | Configuration | MTP | UBB | Prefill Speed | Prefill Time | Token Gen Speed | Key Flags |
+| Comparison Pair | Configuration | MTP | UBB | Prefill Speed | Prefill Time | Token Gen Speed | Key Flags |
 |---|---------------|-----|-----|---------------|--------------|-----------------|-----------|
-| 1 | UBB High Boost | OFF | ON | 1288.8 T/s | 10s/batch | ~17-18.5 T/s | `--promptprocessing-ubatchboost-size 6144`, `-b 12888` |
-| 2 | UBB Standard | OFF | ON | ~400 T/s | reload accounted | ~17-18.5 T/s | 20-30K context |
-| 3 | UBB Alt Config | OFF | ON | 230 T/s | 50s/batch | ~22.5 T/s | `--promptprocessing-ubatchboost-size 2816`, `-b 11264` |
-| 4 | Reference Best | OFF | OFF | 375 T/s | 30s/batch | 17-19.5 T/s | `-ub 2816`, `-b 11264` |
-| 5 | MTP ON, UBB OFF | ON | OFF | 120 T/s | 100s/batch | ~24 T/s | `-ub 512`, `-b 12288` |
-| 6 | MTP ON, UBB OFF Slow | ON | OFF | 80 T/s | 132-141s/batch | ~24 T/s | VRAM spill close |
+| 1 | UBB enabled raw batch speed | :x: | :heavy_check_mark: | 1288.8 T/s | 10s/batch | ~18 T/s | `--promptprocessing-ubatchboost-size 6144`, `-b 12888` |
+| - | UBB First Token | :x: | :heavy_check_mark: |   400 T/s | reload included | ~18.5 T/s | 20-30K context, this minimum speed at lower size context. With 4x context, the penalty is diminishingly small|
+| 1 | Reference | :x: | :x: | 375 T/s | 30s/batch |   ~19.5 T/s | `-ub 2816`, `-b 11264` |
+|-|
+| 2 | UBB  | :heavy_check_mark: | :heavy_check_mark: | 230 T/s | 50s/batch | ~22.5 T/s | `--promptprocessing-ubatchboost-size 2816`, `-b 11264` |
+| 2 | Ref. | :heavy_check_mark: | :x: | 120 T/s | 100s/batch |   ~24 T/s | `-ub 512`, `-b 12288`, `--spec-type draft-mtp` |
+| 2 | Ref. higher def. ubatch | :heavy_check_mark: | :x: |   ~80 T/s | 132-141s/batch | ~24 T/s | VRAM spill close, `-ub 768 --spec-type draft-mtp` |
 
-## Detailed Test Configurations
-
-### Test 1: UBB High Boost, MTP OFF
-
-| Parameter | Value |
-|-----------|-------|
-| MTP | OFF |
-| UBB | ON |
-| Prefill Speed | 1288.8 T/s |
-| Prefill Time | 10s per batch, pure prefill, model reload unaccounted |
-| Token Generation | ~17-18.5 T/s |
-| Context | 20-30K |
-
-Flags:
-
-```text
--b 12888
---promptprocessing-ubatchboost-size 6144
---promptprocessing-ubatchboost-gpu-layers 1
---promptprocessing-ubatchboost-spec-draft-off
---tokengeneration-no-warmup
-```
-
-Real-world prefill at 20-30K context was about 400 T/s with model reload penalty accounted. Larger contexts benefit more from UBB.
-
-### Test 2: UBB Standard, MTP OFF
-
-| Parameter | Value |
-|-----------|-------|
-| MTP | OFF |
-| UBB | ON |
-| Prefill Speed | 230 T/s |
-| Prefill Time | 50s per batch, pure prefill |
-| Token Generation | ~22.5 T/s |
-
-Flags:
-
-```text
--b 11264
---promptprocessing-ubatchboost-size 2816
---promptprocessing-ubatchboost-gpu-layers 1
---tokengeneration-no-warmup
-```
-
-### Test 3: Reference, MTP OFF, UBB OFF
-
-| Parameter | Value |
-|-----------|-------|
-| MTP | OFF |
-| UBB | OFF |
-| Prefill Speed | 375 T/s |
-| Prefill Time | 30s per batch |
-| Token Generation | 17-19.5 T/s |
-| Notes | Slows down when batch split at continuing prompts |
-
-Flags:
-
-```text
--ub 2816
--b 11264
-```
-
-`-ub 3072` may be too much for 8GB VRAM.
-
-### Test 4: MTP ON, UBB OFF
-
-| Parameter | Value 1 | Value 2 |
-|-----------|---------|---------|
-| MTP | ON | ON |
-| UBB | OFF | OFF |
-| Prefill Speed | 120 T/s | 80 T/s |
-| Prefill Time | 100s/batch | 132-141s/batch |
-| Token Generation | ~24 T/s | ~24 T/s |
-| ubatch | 768 | 512 |
-| Batch Size | 12288 | 12288 |
-| VRAM Usage | Non-spilling | ~7.4GB, close to spill |
-
-Flags:
-
-```text
---spec-type mtp
--ub 512
--b 12288
-```
-
-### Test 5: MTP ON, UBB ON
-
-| Parameter | Value |
-|-----------|-------|
-| MTP | ON |
-| UBB | ON |
-| Prefill Speed | 230 T/s |
-| Prefill Time | 50s per batch |
-| Token Generation | ~22.5 T/s |
-
-Flags:
-
-```text
--m Qwen3.6-35BA3B-MTP-Q8_0.gguf
--b 11264
---promptprocessing-ubatchboost-size 2816
---promptprocessing-ubatchboost-gpu-layers 1
---spec-type mtp
---spec-draft-n-max 2
---tokengeneration-no-warmup
-```
-
-## Default Test Settings
-
-| Flag | Value |
-|------|-------|
-| `--parallel` | 1 |
-| `--top-k` | 20 |
-| `--min-p` | 0.0 |
-| `--temperature` | 0.6 |
-| `--log-prefix` | enabled |
-| `--log-timestamps` | enabled |
-| `--threads` | 23 |
-| `--gpu-layers` / `-ngl` | 99, tweaked during UBB |
-| `--n-cpu-moe` | 40 |
-| `--no-mmap` | enabled |
-| `-c` | 131072 |
-| `-ub` | 512 default runtime unless a test says otherwise |
-| `-ctk` | q4_0 |
-| `-ctv` | q4_0 |
-
-VRAM usage was about 7-7.5GB on an RTX 2080 8GB.
-
-## Key Observations
-
-| Observation | Detail |
-|-------------|--------|
-| UBB benefit | Larger context makes UBB more useful. |
-| MTP advantage | MTP can keep token-generation speed higher, but it costs VRAM and prompt speed. |
-| VRAM constraint | The 8GB RTX 2080 VRAM limit is the main tuning limit. |
-| Model reload | Reload cost matters less for very large prompts. |
-| Optimal ubatch | Boost during prompt processing, default lower ubatch during token generation. |
-| Best TG speed | About 24 T/s with MTP ON in the tested setup. |
-| Best prefill | 1288.8 T/s burst with UBB high boost. |
-
-## Known Issues And Notes
-
-| Issue | Detail |
-|-------|--------|
-| Connection handling | For model reload testing, the connection was kept active to measure real-world prefill speed combined with reload time. |
-| MTP and UBB | If `--promptprocessing-ubatchboost-spec-draft-off` is used, UBB cache restored into the default runtime is target-only. Speculative generation is disabled for that restored continuation instead of full prompt re-evaluating. |
-| Git upload | Build outputs, model files, logs, and local backups are intentionally excluded. |

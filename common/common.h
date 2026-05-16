@@ -426,7 +426,8 @@ struct common_params {
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t promptprocessing_ubatchboost_size       =     0; // server-only prompt processing ubatch boost size, 0 = disabled
-    int32_t promptprocessing_ubatchboost_gpu_layers =     0; // server-only prompt processing ubatch boost GPU layers
+    int32_t promptprocessing_ubatchboost_gpu_layers =    -3; // server-only prompt processing ubatch boost GPU layers, -3 = inherit
+    int32_t promptprocessing_ubatchboost_n_cpu_moe  =    -1; // server-only prompt processing ubatch boost MoE CPU layers, -1 = inherit
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

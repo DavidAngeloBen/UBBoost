@@ -2398,7 +2398,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
         {"--promptprocessing-ubatchboost-gpu-layers"}, "N",
-        "server-only GPU layers for the prompt processing ubatch boost runtime, either an exact number, 'auto', or 'all' (default: 0)",
+        "server-only GPU layers for the prompt processing ubatch boost runtime, either an exact number, 'auto', or 'all' (default: inherit --gpu-layers)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.promptprocessing_ubatchboost_gpu_layers = -1;
@@ -2413,6 +2413,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPTPROCESSING_UBATCHBOOST_GPU_LAYERS"));
+    add_opt(common_arg(
+        {"--promptprocessing-ubatchboost-n-cpu-moe"}, "N",
+        "server-only: keep the MoE weights of the first N layers in the CPU for the prompt processing ubatch boost runtime",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.promptprocessing_ubatchboost_n_cpu_moe = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROMPTPROCESSING_UBATCHBOOST_N_CPU_MOE"));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"

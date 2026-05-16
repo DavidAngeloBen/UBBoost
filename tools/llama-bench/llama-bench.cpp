@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
+#include <climits>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <iterator>
+#include <list>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -25,6 +27,8 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
+#include "speculative.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -348,6 +352,8 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    common_params_speculative        speculative;
+    int                              spec_draft_ctx_size;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -392,6 +398,8 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* speculative          */ {},
+    /* spec_draft_ctx_size  */ 0,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -461,6 +469,53 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --spec-type <%s>                            speculative decoding type (default: %s)\n",
+            common_speculative_all_types_str(),
+            common_speculative_type_name_str(cmd_params_defaults.speculative.types).c_str());
+    printf("  --spec-draft-model, -md, --model-draft FNAME draft model for speculative decoding (default: unused)\n");
+    printf("  --spec-draft-ngl, -ngld, --gpu-layers-draft N|auto|all\n");
+    printf("                                              draft model GPU layers (default: auto)\n");
+    printf("  --spec-draft-device, -devd, --device-draft <dev0/dev1/...>\n");
+    printf("                                              draft model devices (default: auto)\n");
+    printf("  --spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE\n");
+    printf("  --spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE\n");
+    printf("  --spec-draft-n-max N                        number of tokens to draft (default: %d)\n",
+            cmd_params_defaults.speculative.draft.n_max);
+    printf("  --spec-draft-n-min N                        minimum draft length (default: %d)\n",
+            cmd_params_defaults.speculative.draft.n_min);
+    printf("  --spec-draft-p-split, --draft-p-split P     speculative split probability (default: %.2f)\n",
+            (double) cmd_params_defaults.speculative.draft.p_split);
+    printf("  --spec-draft-p-min, --draft-p-min P         minimum speculative probability (default: %.2f)\n",
+            (double) cmd_params_defaults.speculative.draft.p_min);
+    printf("  --spec-draft-ctx-size, -cd, --ctx-size-draft N\n");
+    printf("                                              draft context size (default: 0, use benchmark ctx)\n");
+    printf("  --spec-ngram-mod-n-min N                    ngram-mod minimum draft tokens (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_mod.n_min);
+    printf("  --spec-ngram-mod-n-max N                    ngram-mod maximum draft tokens (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_mod.n_max);
+    printf("  --spec-ngram-mod-n-match N                  ngram-mod lookup length (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_mod.n_match);
+    printf("  --spec-ngram-simple-size-n N                ngram-simple lookup n-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_simple.size_n);
+    printf("  --spec-ngram-simple-size-m N                ngram-simple draft m-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_simple.size_m);
+    printf("  --spec-ngram-simple-min-hits N              ngram-simple minimum hits (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_simple.min_hits);
+    printf("  --spec-ngram-map-k-size-n N                 ngram-map-k lookup n-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k.size_n);
+    printf("  --spec-ngram-map-k-size-m N                 ngram-map-k draft m-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k.size_m);
+    printf("  --spec-ngram-map-k-min-hits N               ngram-map-k minimum hits (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k.min_hits);
+    printf("  --spec-ngram-map-k4v-size-n N               ngram-map-k4v lookup n-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k4v.size_n);
+    printf("  --spec-ngram-map-k4v-size-m N               ngram-map-k4v draft m-gram (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k4v.size_m);
+    printf("  --spec-ngram-map-k4v-min-hits N             ngram-map-k4v minimum hits (default: %d)\n",
+            cmd_params_defaults.speculative.ngram_map_k4v.min_hits);
+    printf("  -lcs, --lookup-cache-static FNAME           static ngram cache for speculative decoding\n");
+    printf("  -lcd, --lookup-cache-dynamic FNAME          dynamic ngram cache for speculative decoding\n");
+    printf("  --spec-default                              enable default ngram speculative decoding config\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -497,6 +552,22 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     return GGML_TYPE_COUNT;
 }
 
+static int parse_spec_draft_ngl(const std::string & value) {
+    if (value == "auto") {
+        return -1;
+    }
+    if (value == "all") {
+        return -2;
+    }
+    return std::stoi(value);
+}
+
+static void validate_spec_ngram_range(int value, int min, int max, const char * name) {
+    if (value < min || value > max) {
+        throw std::invalid_argument(string_format("%s must be between %d and %d inclusive", name, min, max));
+    }
+}
+
 static cmd_params parse_cmd_params(int argc, char ** argv) {
     cmd_params        params;
     std::string       arg;
@@ -513,6 +584,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.speculative          = cmd_params_defaults.speculative;
+    params.spec_draft_ctx_size  = cmd_params_defaults.spec_draft_ctx_size;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -988,6 +1061,222 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & v : p) {
                     params.fit_params_min_ctx.push_back(std::stoul(v));
                 }
+            } else if (arg == "--spec-type") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.types = common_speculative_types_from_names(string_split<std::string>(argv[i], split_delim));
+            } else if (arg == "--spec-draft-model" || arg == "-md" || arg == "--model-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.mparams.path = argv[i];
+            } else if (arg == "--spec-draft-threads" || arg == "-td" || arg == "--threads-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.cpuparams.n_threads = std::stoi(argv[i]);
+            } else if (arg == "--spec-draft-threads-batch" || arg == "-tbd" || arg == "--threads-batch-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.cpuparams_batch.n_threads = std::stoi(argv[i]);
+            } else if (arg == "--spec-draft-ngl" || arg == "-ngld" ||
+                       arg == "--gpu-layers-draft" || arg == "--n-gpu-layers-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.n_gpu_layers = parse_spec_draft_ngl(argv[i]);
+            } else if (arg == "--spec-draft-device" || arg == "-devd" || arg == "--device-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.devices = parse_devices_arg(argv[i]);
+            } else if (arg == "--spec-draft-type-k" || arg == "-ctkd" || arg == "--cache-type-k-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.cache_type_k = ggml_type_from_name(argv[i]);
+                invalid_param = params.speculative.draft.cache_type_k == GGML_TYPE_COUNT;
+            } else if (arg == "--spec-draft-type-v" || arg == "-ctvd" || arg == "--cache-type-v-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.cache_type_v = ggml_type_from_name(argv[i]);
+                invalid_param = params.speculative.draft.cache_type_v == GGML_TYPE_COUNT;
+            } else if (arg == "--spec-draft-cpu-moe" || arg == "-cmoed" || arg == "--cpu-moe-draft") {
+                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            } else if (arg == "--spec-draft-n-cpu-moe" || arg == "--spec-draft-ncmoe" ||
+                       arg == "-ncmoed" || arg == "--n-cpu-moe-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const int n_cpu_moe_draft = std::stoi(argv[i]);
+                if (n_cpu_moe_draft < 0) {
+                    invalid_param = true;
+                    break;
+                }
+                static std::list<std::string> buft_overrides_draft;
+                for (int j = 0; j < n_cpu_moe_draft; ++j) {
+                    buft_overrides_draft.push_back(llm_ffn_exps_block_regex(j));
+                    params.speculative.draft.tensor_buft_overrides.push_back({
+                        buft_overrides_draft.back().c_str(), ggml_backend_cpu_buffer_type()
+                    });
+                }
+            } else if (arg == "--spec-draft-n-max") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.n_max = std::stoi(argv[i]);
+            } else if (arg == "--spec-draft-n-min") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.n_min = std::stoi(argv[i]);
+            } else if (arg == "--spec-draft-p-split" || arg == "--draft-p-split") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.p_split = std::stof(argv[i]);
+            } else if (arg == "--spec-draft-p-min" || arg == "--draft-p-min") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.draft.p_min = std::stof(argv[i]);
+            } else if (arg == "--spec-draft-ctx-size" || arg == "-cd" || arg == "--ctx-size-draft") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.spec_draft_ctx_size = std::stoi(argv[i]);
+                if (params.spec_draft_ctx_size < 0) {
+                    invalid_param = true;
+                    break;
+                }
+            } else if (arg == "--spec-ngram-mod-n-min") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_mod.n_min = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_mod.n_min, 0, 1024, "ngram n-min");
+            } else if (arg == "--spec-ngram-mod-n-max") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_mod.n_max = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_mod.n_max, 0, 1024, "ngram n-max");
+            } else if (arg == "--spec-ngram-mod-n-match") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_mod.n_match = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_mod.n_match, 1, 1024, "ngram n-match");
+            } else if (arg == "--spec-ngram-simple-size-n") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_simple.size_n = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_simple.size_n, 1, 1024, "ngram-simple size-n");
+            } else if (arg == "--spec-ngram-simple-size-m") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_simple.size_m = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_simple.size_m, 1, 1024, "ngram-simple size-m");
+            } else if (arg == "--spec-ngram-simple-min-hits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_simple.min_hits = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_simple.min_hits, 1, INT_MAX, "ngram-simple min-hits");
+            } else if (arg == "--spec-ngram-map-k-size-n") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k.size_n = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k.size_n, 1, 1024, "ngram-map-k size-n");
+            } else if (arg == "--spec-ngram-map-k-size-m") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k.size_m = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k.size_m, 1, 1024, "ngram-map-k size-m");
+            } else if (arg == "--spec-ngram-map-k-min-hits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k.min_hits = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k.min_hits, 1, INT_MAX, "ngram-map-k min-hits");
+            } else if (arg == "--spec-ngram-map-k4v-size-n") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k4v.size_n = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k4v.size_n, 1, 1024, "ngram-map-k4v size-n");
+            } else if (arg == "--spec-ngram-map-k4v-size-m") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k4v.size_m = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k4v.size_m, 1, 1024, "ngram-map-k4v size-m");
+            } else if (arg == "--spec-ngram-map-k4v-min-hits") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_map_k4v.min_hits = std::stoi(argv[i]);
+                validate_spec_ngram_range(params.speculative.ngram_map_k4v.min_hits, 1, INT_MAX, "ngram-map-k4v min-hits");
+            } else if (arg == "-lcs" || arg == "--lookup-cache-static") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_cache.lookup_cache_static = argv[i];
+            } else if (arg == "-lcd" || arg == "--lookup-cache-dynamic") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.speculative.ngram_cache.lookup_cache_dynamic = argv[i];
+            } else if (arg == "--spec-default") {
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NGRAM_MOD };
+                params.speculative.ngram_mod.n_match = 24;
+                params.speculative.ngram_mod.n_min = 48;
+                params.speculative.ngram_mod.n_max = 64;
+            } else if (arg == "--draft" || arg == "--draft-n" || arg == "--draft-max") {
+                throw std::invalid_argument("the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max");
+            } else if (arg == "--draft-min" || arg == "--draft-n-min") {
+                throw std::invalid_argument("the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min");
+            } else if (arg == "--spec-ngram-size-n") {
+                throw std::invalid_argument("the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match");
+            } else if (arg == "--spec-ngram-size-m") {
+                throw std::invalid_argument("the argument has been removed. use the respective --spec-ngram-*-size-m");
+            } else if (arg == "--spec-ngram-min-hits") {
+                throw std::invalid_argument("the argument has been removed. use the respective --spec-ngram-*-min-hits");
             } else {
                 invalid_param = true;
                 break;
@@ -1003,6 +1292,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
         print_usage(argc, argv);
         exit(1);
+    }
+
+    if (!params.speculative.draft.tensor_buft_overrides.empty() &&
+            params.speculative.draft.tensor_buft_overrides.back().pattern != nullptr) {
+        params.speculative.draft.tensor_buft_overrides.push_back({ nullptr, nullptr });
     }
 
     if (!params.hf_repo.empty()) {
@@ -1149,6 +1443,8 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    common_params_speculative speculative;
+    int                spec_draft_ctx_size;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1295,6 +1591,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .speculative  = */ params.speculative,
+                /* .spec_draft_ctx_size = */ params.spec_draft_ctx_size,
             };
             instances.push_back(instance);
         }
@@ -1332,6 +1630,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .speculative  = */ params.speculative,
+                /* .spec_draft_ctx_size = */ params.spec_draft_ctx_size,
             };
             instances.push_back(instance);
         }
@@ -1369,6 +1669,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .speculative  = */ params.speculative,
+                /* .spec_draft_ctx_size = */ params.spec_draft_ctx_size,
             };
             instances.push_back(instance);
         }
@@ -1414,6 +1716,32 @@ struct test {
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
+    std::string              spec_type;
+    std::string              spec_draft_model;
+    int                      spec_draft_ngl;
+    ggml_type                spec_draft_type_k;
+    ggml_type                spec_draft_type_v;
+    int                      spec_draft_ctx_size;
+    int                      spec_draft_n_min;
+    int                      spec_draft_n_max;
+    float                    spec_draft_p_split;
+    float                    spec_draft_p_min;
+    int                      spec_ngram_mod_n_min;
+    int                      spec_ngram_mod_n_max;
+    int                      spec_ngram_mod_n_match;
+    int                      spec_ngram_simple_size_n;
+    int                      spec_ngram_simple_size_m;
+    int                      spec_ngram_simple_min_hits;
+    int                      spec_ngram_map_k_size_n;
+    int                      spec_ngram_map_k_size_m;
+    int                      spec_ngram_map_k_min_hits;
+    int                      spec_ngram_map_k4v_size_n;
+    int                      spec_ngram_map_k4v_size_m;
+    int                      spec_ngram_map_k4v_min_hits;
+    std::string              spec_ngram_cache_static;
+    std::string              spec_ngram_cache_dynamic;
+    int                      spec_drafted;
+    int                      spec_accepted;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
@@ -1454,6 +1782,32 @@ struct test {
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
+        spec_type      = common_speculative_type_name_str(inst.speculative.types);
+        spec_draft_model = inst.speculative.draft.mparams.path.empty() ? "none" : inst.speculative.draft.mparams.path;
+        spec_draft_ngl = inst.speculative.draft.n_gpu_layers;
+        spec_draft_type_k = inst.speculative.draft.cache_type_k;
+        spec_draft_type_v = inst.speculative.draft.cache_type_v;
+        spec_draft_ctx_size = inst.spec_draft_ctx_size;
+        spec_draft_n_min = inst.speculative.draft.n_min;
+        spec_draft_n_max = inst.speculative.draft.n_max;
+        spec_draft_p_split = inst.speculative.draft.p_split;
+        spec_draft_p_min = inst.speculative.draft.p_min;
+        spec_ngram_mod_n_min = inst.speculative.ngram_mod.n_min;
+        spec_ngram_mod_n_max = inst.speculative.ngram_mod.n_max;
+        spec_ngram_mod_n_match = inst.speculative.ngram_mod.n_match;
+        spec_ngram_simple_size_n = inst.speculative.ngram_simple.size_n;
+        spec_ngram_simple_size_m = inst.speculative.ngram_simple.size_m;
+        spec_ngram_simple_min_hits = inst.speculative.ngram_simple.min_hits;
+        spec_ngram_map_k_size_n = inst.speculative.ngram_map_k.size_n;
+        spec_ngram_map_k_size_m = inst.speculative.ngram_map_k.size_m;
+        spec_ngram_map_k_min_hits = inst.speculative.ngram_map_k.min_hits;
+        spec_ngram_map_k4v_size_n = inst.speculative.ngram_map_k4v.size_n;
+        spec_ngram_map_k4v_size_m = inst.speculative.ngram_map_k4v.size_m;
+        spec_ngram_map_k4v_min_hits = inst.speculative.ngram_map_k4v.min_hits;
+        spec_ngram_cache_static = inst.speculative.ngram_cache.lookup_cache_static.empty() ? "none" : inst.speculative.ngram_cache.lookup_cache_static;
+        spec_ngram_cache_dynamic = inst.speculative.ngram_cache.lookup_cache_dynamic.empty() ? "none" : inst.speculative.ngram_cache.lookup_cache_dynamic;
+        spec_drafted = 0;
+        spec_accepted = 0;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
@@ -1477,6 +1831,14 @@ struct test {
     double avg_ts() const { return ::avg(get_ts()); }
 
     double stdev_ts() const { return ::stdev(get_ts()); }
+
+    double spec_acceptance() const {
+        return spec_drafted > 0 ? (double) spec_accepted / (double) spec_drafted : 0.0;
+    }
+
+    double spec_accepted_per_token() const {
+        return n_gen > 0 ? (double) spec_accepted / (double) n_gen : 0.0;
+    }
 
     static std::string get_backend() {
         std::vector<std::string> backends;
@@ -1510,7 +1872,18 @@ struct test {
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts",
+            "spec_type",      "spec_draft_model",                  "spec_draft_ngl",
+            "spec_draft_type_k",                 "spec_draft_type_v",
+            "spec_draft_ctx_size",
+            "spec_draft_n_min",                  "spec_draft_n_max",
+            "spec_draft_p_split",                "spec_draft_p_min",
+            "spec_ngram_mod_n_min",              "spec_ngram_mod_n_max",              "spec_ngram_mod_n_match",
+            "spec_ngram_simple_size_n",          "spec_ngram_simple_size_m",          "spec_ngram_simple_min_hits",
+            "spec_ngram_map_k_size_n",           "spec_ngram_map_k_size_m",           "spec_ngram_map_k_min_hits",
+            "spec_ngram_map_k4v_size_n",         "spec_ngram_map_k4v_size_m",         "spec_ngram_map_k4v_min_hits",
+            "spec_ngram_cache_static",           "spec_ngram_cache_dynamic",
+            "spec_drafted", "spec_accepted", "spec_acceptance", "spec_accepted_per_token"
         };
         return fields;
     }
@@ -1522,14 +1895,23 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx") {
+            field == "fit_target" || field == "fit_min_ctx" ||
+            field == "spec_draft_ngl" || field == "spec_draft_ctx_size" ||
+            field == "spec_draft_n_min" || field == "spec_draft_n_max" ||
+            field == "spec_ngram_mod_n_min" || field == "spec_ngram_mod_n_max" || field == "spec_ngram_mod_n_match" ||
+            field == "spec_ngram_simple_size_n" || field == "spec_ngram_simple_size_m" || field == "spec_ngram_simple_min_hits" ||
+            field == "spec_ngram_map_k_size_n" || field == "spec_ngram_map_k_size_m" || field == "spec_ngram_map_k_min_hits" ||
+            field == "spec_ngram_map_k4v_size_n" || field == "spec_ngram_map_k4v_size_m" || field == "spec_ngram_map_k4v_min_hits" ||
+            field == "spec_drafted" || field == "spec_accepted") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" ||
+            field == "spec_draft_p_split" || field == "spec_draft_p_min" ||
+            field == "spec_acceptance" || field == "spec_accepted_per_token") {
             return FLOAT;
         }
         return STRING;
@@ -1612,7 +1994,35 @@ struct test {
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
-                                            std::to_string(stdev_ts()) };
+                                            std::to_string(stdev_ts()),
+                                            spec_type,
+                                            spec_draft_model,
+                                            std::to_string(spec_draft_ngl),
+                                            ggml_type_name(spec_draft_type_k),
+                                            ggml_type_name(spec_draft_type_v),
+                                            std::to_string(spec_draft_ctx_size),
+                                            std::to_string(spec_draft_n_min),
+                                            std::to_string(spec_draft_n_max),
+                                            std::to_string(spec_draft_p_split),
+                                            std::to_string(spec_draft_p_min),
+                                            std::to_string(spec_ngram_mod_n_min),
+                                            std::to_string(spec_ngram_mod_n_max),
+                                            std::to_string(spec_ngram_mod_n_match),
+                                            std::to_string(spec_ngram_simple_size_n),
+                                            std::to_string(spec_ngram_simple_size_m),
+                                            std::to_string(spec_ngram_simple_min_hits),
+                                            std::to_string(spec_ngram_map_k_size_n),
+                                            std::to_string(spec_ngram_map_k_size_m),
+                                            std::to_string(spec_ngram_map_k_min_hits),
+                                            std::to_string(spec_ngram_map_k4v_size_n),
+                                            std::to_string(spec_ngram_map_k4v_size_m),
+                                            std::to_string(spec_ngram_map_k4v_min_hits),
+                                            spec_ngram_cache_static,
+                                            spec_ngram_cache_dynamic,
+                                            std::to_string(spec_drafted),
+                                            std::to_string(spec_accepted),
+                                            std::to_string(spec_acceptance()),
+                                            std::to_string(spec_accepted_per_token()) };
         return values;
     }
 
@@ -2112,6 +2522,250 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     return true;
 }
 
+struct bench_spec_context {
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model_dft{ nullptr, llama_model_free };
+    std::unique_ptr<llama_context, decltype(&llama_free)>     ctx_dft  { nullptr, llama_free };
+    common_speculative_ptr spec;
+    common_params_speculative params;
+};
+
+static bool bench_spec_has_type(const common_params_speculative & params, common_speculative_type type) {
+    return std::find(params.types.begin(), params.types.end(), type) != params.types.end();
+}
+
+static bool bench_spec_enabled(const common_params_speculative & params) {
+    return params.has_dft() || (params.types.size() != 1 || params.types[0] != COMMON_SPECULATIVE_TYPE_NONE);
+}
+
+struct bench_spec_stats {
+    int n_drafted  = 0;
+    int n_accepted = 0;
+};
+
+static llama_model_params bench_spec_model_params(
+        const cmd_params_instance & inst,
+        const common_params_speculative_draft & draft) {
+    llama_model_params mparams = llama_model_default_params();
+
+    mparams.n_gpu_layers = draft.n_gpu_layers == -1 ? inst.n_gpu_layers : draft.n_gpu_layers;
+    if (!draft.devices.empty()) {
+        mparams.devices = const_cast<ggml_backend_dev_t *>(draft.devices.data());
+    } else if (!inst.devices.empty()) {
+        mparams.devices = const_cast<ggml_backend_dev_t *>(inst.devices.data());
+    }
+    mparams.split_mode    = inst.split_mode;
+    mparams.main_gpu      = inst.main_gpu;
+    mparams.tensor_split  = const_cast<float *>(inst.tensor_split.data());
+    mparams.use_mmap      = inst.use_mmap;
+    mparams.use_direct_io = inst.use_direct_io;
+    mparams.no_host       = inst.no_host;
+
+    if (!draft.tensor_buft_overrides.empty()) {
+        GGML_ASSERT(draft.tensor_buft_overrides.back().pattern == nullptr &&
+                    "Draft tensor buffer overrides not terminated with empty pattern");
+        mparams.tensor_buft_overrides = draft.tensor_buft_overrides.data();
+    }
+
+    return mparams;
+}
+
+static llama_context_params bench_spec_context_params(
+        const cmd_params_instance & inst,
+        const common_params_speculative_draft & draft) {
+    llama_context_params cparams = inst.to_llama_cparams();
+
+    cparams.n_ctx = inst.spec_draft_ctx_size > 0 ?
+        (uint32_t) inst.spec_draft_ctx_size : std::max<uint32_t>(cparams.n_ctx, 32);
+    cparams.type_k = draft.cache_type_k;
+    cparams.type_v = draft.cache_type_v;
+    if (draft.cpuparams.n_threads > 0) {
+        cparams.n_threads = draft.cpuparams.n_threads;
+        cparams.n_threads_batch = draft.cpuparams_batch.n_threads > 0 ?
+            draft.cpuparams_batch.n_threads : draft.cpuparams.n_threads;
+    }
+
+    return cparams;
+}
+
+static bool bench_spec_init(
+        const cmd_params_instance & inst,
+        llama_context * ctx_tgt,
+        llama_model * model_tgt,
+        bench_spec_context & out) {
+    out.params = inst.speculative;
+    out.params.draft.ctx_tgt = ctx_tgt;
+
+    if (out.params.has_dft()) {
+        const auto & draft = out.params.draft;
+        auto mparams_dft = bench_spec_model_params(inst, draft);
+
+        out.model_dft.reset(llama_model_load_from_file(draft.mparams.path.c_str(), mparams_dft));
+        if (!out.model_dft) {
+            fprintf(stderr, "%s: failed to load draft model '%s'\n", __func__, draft.mparams.path.c_str());
+            return false;
+        }
+
+        auto cparams_dft = bench_spec_context_params(inst, draft);
+        cparams_dft.n_rs_seq = 0;
+        if (bench_spec_has_type(out.params, COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+
+        out.ctx_dft.reset(llama_init_from_model(out.model_dft.get(), cparams_dft));
+        if (!out.ctx_dft) {
+            fprintf(stderr, "%s: failed to create draft context\n", __func__);
+            return false;
+        }
+        out.params.draft.ctx_dft = out.ctx_dft.get();
+    } else if (bench_spec_has_type(out.params, COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        auto cparams_mtp = bench_spec_context_params(inst, out.params.draft);
+        cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_mtp.n_rs_seq = 0;
+
+        out.ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+        if (!out.ctx_dft) {
+            fprintf(stderr, "%s: failed to create draft-mtp context\n", __func__);
+            return false;
+        }
+        out.params.draft.ctx_dft = out.ctx_dft.get();
+    }
+
+    out.spec.reset(common_speculative_init(out.params, 1));
+    return out.spec != nullptr;
+}
+
+static bool test_gen_speculative(
+        llama_context * ctx,
+        bench_spec_context & spec_ctx,
+        int n_gen,
+        bench_spec_stats * stats,
+        int n_threads) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+    if (spec_ctx.ctx_dft) {
+        llama_set_n_threads(spec_ctx.ctx_dft.get(), n_threads, n_threads);
+    }
+
+    const llama_model * model   = llama_get_model(ctx);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+    constexpr llama_seq_id seq_id = 0;
+
+    llama_token id_last = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    llama_tokens prompt;
+    prompt.reserve((size_t) n_gen + 1);
+
+    common_speculative_begin(spec_ctx.spec.get(), seq_id, prompt);
+
+    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+    llama_tokens draft;
+
+    int n_past = 0;
+    int n_done = 0;
+
+    if (stats) {
+        stats->n_drafted  = 0;
+        stats->n_accepted = 0;
+    }
+
+    if (spec_ctx.ctx_dft && n_gen > 0) {
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, id_last, n_past++, { seq_id }, true);
+
+        const int res = llama_decode(ctx, batch_tgt);
+        if (res != 0) {
+            fprintf(stderr, "%s: failed to decode initial generation token, res = %d\n", __func__, res);
+            llama_batch_free(batch_tgt);
+            return false;
+        }
+
+        if (spec_ctx.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(spec_ctx.ctx_dft.get()), seq_id, batch_tgt.pos[0], -1);
+        }
+        if (!common_speculative_process(spec_ctx.spec.get(), batch_tgt)) {
+            fprintf(stderr, "%s: failed to process initial speculative batch\n", __func__);
+            llama_batch_free(batch_tgt);
+            return false;
+        }
+
+        prompt.push_back(id_last);
+        id_last = std::rand() % n_vocab;
+        n_done++;
+    }
+
+    while (n_done < n_gen) {
+        if (draft.empty()) {
+            common_speculative_get_draft_params(spec_ctx.spec.get(), seq_id) = {
+                /* .drafting   = */ true,
+                /* .n_max      = */ n_gen - n_done - 1,
+                /* .n_past     = */ n_past,
+                /* .id_last    = */ id_last,
+                /* .prompt     = */ &prompt,
+                /* .result     = */ &draft,
+            };
+            common_speculative_draft(spec_ctx.spec.get());
+        }
+
+        common_batch_clear(batch_tgt);
+        common_batch_add(batch_tgt, id_last, n_past++, { seq_id }, true);
+
+        const int n_draft = std::min((int) draft.size(), n_gen - n_done - 1);
+        for (int i = 0; i < n_draft; ++i) {
+            common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
+        }
+
+        const int res = llama_decode(ctx, batch_tgt);
+        if (res != 0) {
+            fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
+            llama_batch_free(batch_tgt);
+            return false;
+        }
+
+        if (spec_ctx.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(spec_ctx.ctx_dft.get()), seq_id, batch_tgt.pos[0], -1);
+        }
+        if (!common_speculative_process(spec_ctx.spec.get(), batch_tgt)) {
+            fprintf(stderr, "%s: failed to process speculative batch\n", __func__);
+            llama_batch_free(batch_tgt);
+            return false;
+        }
+
+        llama_synchronize(ctx);
+
+        if ((int) draft.size() > n_draft) {
+            draft.resize(n_draft);
+        }
+        const int n_accept = std::min(1 + n_draft, n_gen - n_done);
+        if (stats) {
+            stats->n_drafted  += n_draft;
+            stats->n_accepted += std::max(0, n_accept - 1);
+        }
+        if (n_draft > 0) {
+            common_speculative_accept(spec_ctx.spec.get(), seq_id, (uint16_t) std::max(0, n_accept - 1));
+        }
+
+        for (int i = 0; i < n_accept; ++i) {
+            prompt.push_back(id_last);
+            if (i < n_accept - 1) {
+                id_last = draft[i];
+            } else {
+                id_last = std::rand() % n_vocab;
+            }
+        }
+
+        n_past += n_accept - 1;
+        n_done += n_accept;
+        draft.clear();
+
+        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, n_past, -1);
+        if (spec_ctx.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(spec_ctx.ctx_dft.get()), seq_id, n_past, -1);
+        }
+    }
+
+    llama_batch_free(batch_tgt);
+    return true;
+}
+
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) text;
@@ -2266,6 +2920,22 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        bench_spec_context spec_ctx;
+        const bool use_speculative = bench_spec_enabled(inst.speculative);
+        if (use_speculative) {
+            if (inst.n_depth > 0) {
+                fprintf(stderr, "%s: error: speculative llama-bench does not support -d/--n-depth yet\n", __func__);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            if (!bench_spec_init(inst, ctx, lmodel, spec_ctx)) {
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+        }
+
         test t(inst, lmodel, ctx);
 
         llama_memory_clear(llama_get_memory(ctx), false);
@@ -2315,7 +2985,12 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
+                if (spec_ctx.ctx_dft) {
+                    llama_memory_clear(llama_get_memory(spec_ctx.ctx_dft.get()), false);
+                }
+                bool res = use_speculative ?
+                    test_gen_speculative(ctx, spec_ctx, 1, nullptr, t.n_threads) :
+                    test_gen(ctx, 1, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
@@ -2327,6 +3002,9 @@ int main(int argc, char ** argv) {
 
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
+            if (spec_ctx.ctx_dft) {
+                llama_memory_clear(llama_get_memory(spec_ctx.ctx_dft.get()), false);
+            }
 
             if (t.n_depth > 0) {
                 bool is_cached = t.n_depth == cstate.depth;
@@ -2385,12 +3063,19 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                bench_spec_stats spec_stats;
+                bool res = use_speculative ?
+                    test_gen_speculative(ctx, spec_ctx, t.n_gen, &spec_stats, t.n_threads) :
+                    test_gen(ctx, t.n_gen, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
+                }
+                if (use_speculative) {
+                    t.spec_drafted  += spec_stats.n_drafted;
+                    t.spec_accepted += spec_stats.n_accepted;
                 }
             }
 

@@ -192,7 +192,6 @@ struct server_response_reader {
     // return nullptr if should_stop() is true before receiving a result
     // note: if one error is received, it will stop further processing and return error result
     server_task_result_ptr next(const std::function<bool()> & should_stop);
-    server_task_result_ptr next_with_timeout(const std::function<bool()> & should_stop, int timeout, bool & timed_out);
 
     struct batch_response {
         bool is_terminated = false; // if true, indicates that processing was stopped before all results were received

@@ -614,6 +614,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -654,6 +655,7 @@ private:
     bool ubatchboost_enabled = false;
     bool ubatchboost_runtime_active = false;
     bool default_runtime_active = false;
+    bool ubatchboost_forced_reprocess_active = false;
     bool ubatchboost_default_load_started = false;
     std::shared_ptr<std::promise<bool>> ubatchboost_default_load_release;
     std::future<bool> ubatchboost_default_load_future;
@@ -726,11 +728,51 @@ private:
 
         boost_params.n_ubatch = default_params.promptprocessing_ubatchboost_size;
         boost_params.n_batch  = std::max(default_params.n_batch, default_params.promptprocessing_ubatchboost_size);
-        boost_params.n_gpu_layers = default_params.promptprocessing_ubatchboost_gpu_layers;
+        if (default_params.promptprocessing_ubatchboost_gpu_layers != -3) {
+            boost_params.n_gpu_layers = default_params.promptprocessing_ubatchboost_gpu_layers;
+        }
+        if (default_params.promptprocessing_ubatchboost_n_cpu_moe >= 0) {
+            auto first_terminator = std::find_if(
+                    boost_params.tensor_buft_overrides.begin(),
+                    boost_params.tensor_buft_overrides.end(),
+                    [](const llama_model_tensor_buft_override & override) {
+                        return override.pattern == nullptr;
+                    });
+            boost_params.tensor_buft_overrides.erase(first_terminator, boost_params.tensor_buft_overrides.end());
+            boost_params.tensor_buft_overrides.erase(
+                    std::remove_if(
+                        boost_params.tensor_buft_overrides.begin(),
+                        boost_params.tensor_buft_overrides.end(),
+                        [](const llama_model_tensor_buft_override & override) {
+                            if (override.pattern == nullptr) {
+                                return false;
+                            }
+
+                            const std::string pattern = override.pattern;
+                            return pattern == LLM_FFN_EXPS_REGEX ||
+                                (pattern.rfind("blk\\.", 0) == 0 && pattern.find(LLM_FFN_EXPS_REGEX) != std::string::npos);
+                        }),
+                    boost_params.tensor_buft_overrides.end());
+
+            static std::list<std::string> buft_overrides_ubatchboost_moe;
+            for (int i = 0; i < default_params.promptprocessing_ubatchboost_n_cpu_moe; ++i) {
+                buft_overrides_ubatchboost_moe.push_back(llm_ffn_exps_block_regex(i));
+                boost_params.tensor_buft_overrides.push_back({
+                    buft_overrides_ubatchboost_moe.back().c_str(), ggml_backend_cpu_buffer_type()
+                });
+            }
+
+            const size_t ntbo = llama_max_tensor_buft_overrides();
+            while (boost_params.tensor_buft_overrides.size() < ntbo) {
+                boost_params.tensor_buft_overrides.push_back({nullptr, nullptr});
+            }
+        }
 
         // The boost runtime is explicit. Do not let --fit silently turn a
         // CPU/light-GPU prompt runtime back into the default GPU-heavy runtime.
-        boost_params.fit_params = default_params.promptprocessing_ubatchboost_gpu_layers == -1 && default_params.fit_params;
+        if (default_params.promptprocessing_ubatchboost_gpu_layers != -3) {
+            boost_params.fit_params = default_params.promptprocessing_ubatchboost_gpu_layers == -1 && default_params.fit_params;
+        }
 
         if (default_params.promptprocessing_ubatchboost_spec_draft_off) {
             boost_params.speculative = common_params_speculative {};
@@ -778,11 +820,6 @@ private:
         ubatchboost_default_load_started = true;
         ubatchboost_default_load_release = wait_for_release ? std::make_shared<std::promise<bool>>() : nullptr;
 
-        SRV_INF("loading default runtime for token generation: batch = %d, ubatch = %d, gpu layers = %d, warmup = %s%s\n",
-                default_params_reload.n_batch, default_params_reload.n_ubatch, default_params_reload.n_gpu_layers,
-                default_params_reload.warmup ? "on" : "off",
-                wait_for_release ? " (armed early)" : "");
-
         auto release = ubatchboost_default_load_release;
         ubatchboost_default_load_future = std::async(std::launch::async, [this, default_params_reload, release]() mutable {
             if (release) {
@@ -796,6 +833,7 @@ private:
 
             ubatchboost_runtime_active = false;
             default_runtime_active = true;
+            ubatchboost_forced_reprocess_active = false;
 
             return load_model_internal(default_params_reload, false);
         });
@@ -822,7 +860,7 @@ private:
 
     void clear_idle_prompt_state_for_runtime_reload() {
         if (prompt_cache && !prompt_cache->states.empty()) {
-            SRV_INF("%s: clearing prompt cache before runtime reload, entries = %zu\n",
+            SRV_DBG("%s: clearing prompt cache before runtime reload, entries = %zu\n",
                     __func__, prompt_cache->states.size());
             prompt_cache->states.clear();
         }
@@ -832,7 +870,7 @@ private:
                 continue;
             }
 
-            SLT_INF(slot, "%s", "clearing idle prompt state before runtime reload\n");
+            SLT_DBG(slot, "%s", "clearing idle prompt state before runtime reload\n");
             slot.prompt.tokens.clear();
             slot.prompt.data = {};
             slot.prompt.checkpoints.clear();
@@ -883,10 +921,6 @@ private:
         }
 
         common_params boost_params = make_ubatchboost_params(params_default);
-
-        SRV_INF("prompt processing ubatch boost enabled: boost runtime batch = %d, ubatch = %d, gpu layers = %d; default runtime batch = %d, ubatch = %d, gpu layers = %d\n",
-                boost_params.n_batch, boost_params.n_ubatch, boost_params.n_gpu_layers,
-                params_default.n_batch, params_default.n_ubatch, params_default.n_gpu_layers);
 
         ubatchboost_runtime_active = true;
         default_runtime_active = false;
@@ -1109,11 +1143,7 @@ private:
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-            if (reset_slots) {
-                SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
-            } else {
-                SLT_INF(slot, "reloaded slot runtime, n_ctx = %d\n", slot.n_ctx);
-            }
+            SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
@@ -1457,9 +1487,6 @@ private:
         slot.ctx_tgt = ctx_tgt;
         slot.ctx_dft = ctx_dft.get();
         slot.spec    = spec.get();
-        slot.is_mtp_enabled = (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                                         COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end())
-                              && (ctx_dft != nullptr);
         slot.mctx                   = mctx;
         slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
@@ -2116,6 +2143,10 @@ private:
         return remaining <= 1;
     }
 
+    bool should_send_ubatchboost_stream_keepalive() const {
+        return ubatchboost_default_load_started || ubatchboost_forced_reprocess_active;
+    }
+
     bool ready_to_switch_ubatchboost_to_default_runtime() const {
         if (!ubatchboost_enabled || !ubatchboost_runtime_active || default_runtime_active) {
             return false;
@@ -2190,7 +2221,7 @@ private:
         const bool need_pre_sample_logits = slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs;
         configure_slot_backend_sampler(slot, sampling, need_pre_sample_logits);
 
-        SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+        SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
         return true;
     }
 
@@ -2240,7 +2271,7 @@ private:
 
                 int32_t n_common = 0;
                 if (slot_has_reusable_prompt_state_for_task(slot, task, n_common)) {
-                    SLT_INF(slot, "keeping default runtime for prompt cache reuse, n_common = %d, task.n_tokens = %d\n",
+                    SLT_DBG(slot, "keeping default runtime for prompt cache reuse, n_common = %d, task.n_tokens = %d\n",
                             n_common, task.n_tokens());
                     return true;
                 }
@@ -2263,7 +2294,7 @@ private:
 
             const float sim = float(n_common) / task.tokens.size();
             if (sim > slot_prompt_similarity) {
-                SLT_INF(slot, "keeping default runtime for prompt cache reuse, sim = %.3f (> %.3f thold), n_common = %d, task.n_tokens = %d\n",
+                SLT_DBG(slot, "keeping default runtime for prompt cache reuse, sim = %.3f (> %.3f thold), n_common = %d, task.n_tokens = %d\n",
                         sim, slot_prompt_similarity, n_common, task.n_tokens());
                 return true;
             }
@@ -2294,9 +2325,6 @@ private:
         }
 
         common_params boost_params = make_ubatchboost_params(params_default);
-
-        SRV_INF("loading prompt processing ubatch boost runtime for next prompt: batch = %d, ubatch = %d, gpu layers = %d\n",
-                boost_params.n_batch, boost_params.n_ubatch, boost_params.n_gpu_layers);
 
         clear_idle_prompt_state_for_runtime_reload();
         destroy();
@@ -2335,14 +2363,11 @@ private:
 
         common_params boost_params = make_ubatchboost_params(params_default);
 
-        SLT_WRN(slot,
-                "full prompt re-processing is required; reloading UBBoost runtime: batch = %d, ubatch = %d, gpu layers = %d\n",
-                boost_params.n_batch, boost_params.n_ubatch, boost_params.n_gpu_layers);
-
         cancel_armed_default_runtime_reload();
         clear_idle_prompt_state_for_runtime_reload();
         destroy();
 
+        ubatchboost_forced_reprocess_active = true;
         ubatchboost_runtime_active = true;
         default_runtime_active = false;
 
@@ -2405,7 +2430,7 @@ private:
             std::vector<uint8_t> data_dft;
         };
 
-        SRV_INF("%s", "prompt processing ubatch boost boundary reached, switching to default runtime\n");
+        SRV_DBG("%s", "prompt processing ubatch boost boundary reached, switching to default runtime\n");
 
         llama_synchronize(ctx_tgt);
         const int64_t t_boost_done = ggml_time_us();
@@ -2501,18 +2526,14 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
             slot.spec    = spec.get();
-            slot.is_mtp_enabled = (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                                             COMMON_SPECULATIVE_TYPE_MTP) != params_base.speculative.types.end())
-                                  && (ctx_dft != nullptr);
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             if (params_default.promptprocessing_ubatchboost_spec_draft_off) {
                 slot.ctx_dft = nullptr;
                 slot.spec = nullptr;
-                slot.is_mtp_enabled = false;
                 slot.prompt_checkpoints_tgt_only = true;
-            } else if (slot.is_mtp_enabled && saved.data_dft.empty()) {
+            } else if (slot.can_speculate() && saved.data_dft.empty()) {
                 send_error(slot, "failed to restore MTP draft state after prompt processing ubatch boost", ERROR_TYPE_SERVER);
                 slot.release();
                 continue;
@@ -2526,7 +2547,7 @@ private:
                 continue;
             }
 
-            SLT_INF(slot, "default runtime restored prompt state, n_tokens = %d, remaining prompt tokens = %d\n",
+            SLT_DBG(slot, "default runtime restored prompt state, n_tokens = %d, remaining prompt tokens = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens() - slot.prompt.n_tokens());
         }
     }
@@ -3348,7 +3369,6 @@ private:
                                     }
                                     slot.ctx_dft = nullptr;
                                     slot.spec = nullptr;
-                                    slot.is_mtp_enabled = false;
                                 } else {
                                     slot.prompt_checkpoints_tgt_only = false;
                                 }
@@ -3396,7 +3416,9 @@ private:
 
                     const int64_t t_current = ggml_time_us();
                     slot.t_prompt_processing = (t_current - slot.t_start_process_prompt) / 1e3;
-                    slot.print_timings_pp();
+                    if (!should_hold_last_prompt_token_for_default_runtime(slot)) {
+                        slot.print_timings_pp();
+                    }
 
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
@@ -3475,8 +3497,6 @@ private:
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         if (should_hold_last_prompt_token_for_default_runtime(slot)) {
-                            SLT_INF(slot, "holding last prompt token for default runtime, n_tokens = %d, task.n_tokens = %d\n",
-                                    slot.prompt.n_tokens(), slot.task->n_tokens());
                             break;
                         }
 
@@ -3506,13 +3526,19 @@ private:
 
                         slot.n_prompt_tokens_processed++;
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // In UBB, do not add an extra tail split; the batch loop already makes the final prompt batch
-                        // fit the exact remaining token count. In the default runtime, preserve the upstream offsets.
+                        // Process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                        // For UBB, keep only a small checkpoint tail. The next chat turn can differ by a few template
+                        // tokens near the assistant header, so the reusable checkpoint must sit behind that boundary.
+                        // In the default runtime, preserve the upstream offsets.
                         if (do_checkpoint) {
                             bool should_break = false;
 
-                            if (!ubatchboost_runtime_active) {
+                            if (ubatchboost_runtime_active) {
+                                constexpr int checkpoint_tail = 4;
+                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + checkpoint_tail) {
+                                    should_break = true;
+                                }
+                            } else {
                                 const int checkpoint_offsets_default[] = {4 + n_ubatch, 4};
                                 for (int offset : checkpoint_offsets_default) {
                                     const int n_last = std::min(n_batch, offset);
@@ -3784,7 +3810,9 @@ private:
                 // optionally send prompt processing progress
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                     if (slot.task->params.stream && slot.task->params.return_progress) {
-                        send_partial_response(slot, {}, true);
+                        if (!should_hold_last_prompt_token_for_default_runtime(slot)) {
+                            send_partial_response(slot, {}, true);
+                        }
                     }
                 }
 
@@ -4202,44 +4230,169 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        const bool stream_keepalive = params.promptprocessing_ubatchboost_size > 0;
+        int64_t t_last_keepalive_us = 0;
+        auto next_stream_result = [&rd, &req, this, &t_last_keepalive_us](bool & send_keepalive) -> server_task_result_ptr {
+            send_keepalive = false;
 
-        if (stream_keepalive) {
-            res->data = ": keep-alive\n\n";
-        } else {
-            // in streaming mode, the first error must be treated as non-stream response
-            // this is to match the OAI API behavior
-            // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-            auto first_result = rd.next(req.should_stop);
-            if (first_result == nullptr) {
-                GGML_ASSERT(req.should_stop());
-                return res; // connection is closed
+            while (true) {
+                server_task_result_ptr result = rd.queue_results.recv_with_timeout(rd.id_tasks, rd.polling_interval_seconds);
+                if (result == nullptr) {
+                    if (req.should_stop()) {
+                        SRV_WRN("%s", "stopping wait for next result due to should_stop condition (adjust the --timeout argument if needed)\n");
+                        SRV_WRN("%s", "ref: https://github.com/ggml-org/llama.cpp/pull/22907\n");
+                        return nullptr;
+                    }
+
+                    const int64_t t_now_us = ggml_time_us();
+                    const bool keepalive_due = t_last_keepalive_us == 0 || t_now_us - t_last_keepalive_us >= 10*1000*1000;
+                    if (keepalive_due && ctx_server.should_send_ubatchboost_stream_keepalive()) {
+                        t_last_keepalive_us = t_now_us;
+                        send_keepalive = true;
+                        return nullptr;
+                    }
+
+                    continue;
+                }
+
+                if (result->is_error()) {
+                    rd.stop(); // cancel remaining tasks
+                    SRV_DBG("%s", "received error result, stopping further processing\n");
+                    return result;
+                }
+                if (!rd.states.empty()) {
+                    // update the generation state if needed
+                    const size_t idx = result->index;
+                    GGML_ASSERT(idx < rd.states.size());
+                    result->update(rd.states[idx]);
+                }
+                if (result->is_stop()) {
+                    rd.received_count++;
+                }
+
+                return result;
             }
+        };
 
-            if (first_result->is_error()) {
-                res->error(first_result->to_json());
+        // in streaming mode, the first error must be treated as non-stream response
+        // this is to match the OAI API behavior
+        // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        bool send_keepalive = false;
+        auto first_result = next_stream_result(send_keepalive);
+        if (first_result == nullptr) {
+            if (send_keepalive) {
+                res->data = ": keep-alive\n\n";
+                res->status = 200;
+                res->content_type = "text/event-stream";
+                res->next = [res_this = res.get(), res_type, next_stream_result, &req](std::string & output) -> bool {
+                    static auto format_error = [](task_response_type res_type, const json & res_json) {
+                        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                            return format_anthropic_sse({
+                                {"event", "error"},
+                                {"data", res_json},
+                            });
+                        } else {
+                            return format_oai_sse(json {{ "error", res_json }});
+                        }
+                    };
+
+                    try {
+                        if (req.should_stop()) {
+                            SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                            return false; // should_stop condition met
+                        }
+
+                        if (!res_this->data.empty()) {
+                            // flush the first chunk
+                            output = std::move(res_this->data);
+                            res_this->data.clear();
+                            return true;
+                        }
+
+                        server_response_reader & rd = res_this->rd;
+
+                        // check if there is more data
+                        if (!rd.has_next()) {
+                            switch (res_type) {
+                                case TASK_RESPONSE_TYPE_NONE:
+                                case TASK_RESPONSE_TYPE_OAI_RESP:
+                                case TASK_RESPONSE_TYPE_ANTHROPIC:
+                                    output = "";
+                                    break;
+
+                                default:
+                                    output = "data: [DONE]\n\n";
+                                    break;
+                            }
+                            SRV_DBG("%s", "all results received, terminating stream\n");
+                            return false; // no more data, terminate
+                        }
+
+                        bool send_keepalive = false;
+                        server_task_result_ptr result = next_stream_result(send_keepalive);
+                        if (result == nullptr) {
+                            if (send_keepalive) {
+                                output = ": keep-alive\n\n";
+                                return true;
+                            }
+
+                            SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                            GGML_ASSERT(req.should_stop());
+                            return false; // should_stop condition met
+                        }
+
+                        // send the results
+                        if (result->is_error()) {
+                            json res_json = result->to_json();
+                            output = format_error(res_type, res_json);
+                            SRV_DBG("%s", "error received during streaming, terminating stream\n");
+                            return false; // terminate on error
+                        }
+
+                        json res_json = result->to_json();
+                        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                            output = format_anthropic_sse(res_json);
+                        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                            output = format_oai_resp_sse(res_json);
+                        } else {
+                            output = format_oai_sse(res_json);
+                        }
+                        return true;
+                    } catch (std::exception & e) {
+                        output = format_error(res_type, format_error_response(e.what(), ERROR_TYPE_SERVER));
+                        SRV_ERR("exception while handling next streaming response: %s\n", e.what());
+                        return false;
+                    }
+                };
                 return res;
             }
 
-            GGML_ASSERT(
-                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-            );
+            GGML_ASSERT(req.should_stop());
+            return res; // connection is closed
+        }
 
-            // next responses are streamed
-            // to be sent immediately
-            json first_result_json = first_result->to_json();
-            if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                res->data = format_anthropic_sse(first_result_json);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                res->data = format_oai_resp_sse(first_result_json);
-            } else {
-                res->data = format_oai_sse(first_result_json);
-            }
+        if (first_result->is_error()) {
+            res->error(first_result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(
+            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+        );
+
+        // next responses are streamed
+        // to be sent immediately
+        json first_result_json = first_result->to_json();
+        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+            res->data = format_anthropic_sse(first_result_json);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            res->data = format_oai_resp_sse(first_result_json);
+        } else {
+            res->data = format_oai_sse(first_result_json);
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, stream_keepalive, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -4284,19 +4437,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 // receive subsequent results
-                bool timed_out = false;
                 server_task_result_ptr result;
-                if (stream_keepalive) {
-                    result = rd.next_with_timeout(req.should_stop, rd.polling_interval_seconds, timed_out);
-                } else {
-                    result = rd.next(req.should_stop);
-                }
+                result = rd.next(req.should_stop);
                 if (result == nullptr) {
-                    if (timed_out) {
-                        output = ": keep-alive\n\n";
-                        return true;
-                    }
-
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
